@@ -1,0 +1,31 @@
+name: Run V11-Core 2022 Backtest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run backtest
+        run: |
+          python v11_core_2022_backtest.py
+
+      - name: Upload output
+        uses: actions/upload-artifact@v4
+        with:
+          name: v11-core-2022-output
+          path: output/
