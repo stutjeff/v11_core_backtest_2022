@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-V11-Core 2022 Event Backtest R5-fixed
+V11-Core 2022 Event Backtest R6
 
 Goal:
 - Test whether V11 can switch from 452 to 514 after capital starts leaving risk assets.
@@ -159,7 +159,7 @@ def score_defensive_strength(df: pd.DataFrame) -> pd.Series:
 
 def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
     """
-    Stricter V11 R-mode rules plus R4 V-shaped rebound fast lane.
+    Stricter V11 R-mode rules plus R4 V-shaped rebound fast lane and R6 medium repair lane.
 
     R2 fixed:
     - 433 triggered too early during bear-market rallies.
@@ -172,6 +172,10 @@ def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
     R4 adds:
     - V-shaped rebound fast lane after a true panic regime.
     - If VIX and total score spiked to panic levels, then VIX cools sharply and QQQ/SOXX/credit regain 20D trends, allow 514 -> 452 earlier.
+
+    R6 adds:
+    - Medium repair lane for 2018-like corrections: not severe enough to count as 2020 panic,
+      but recovery should not wait forever if VIX cools, credit stabilizes, and QQQ/SOXX regain 60D trend.
     """
     qqq = df["QQQ"]
     soxx = df["SOXX"]
@@ -249,6 +253,38 @@ def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
         & (conds["fast_count"] >= 6)
         & (components["credit_proxy_score"] < 12)
     )
+
+    # R6: medium repair lane.
+    # For 2018 Q4-like corrections: VIX and score were elevated, but not a full 2020-style panic.
+    # It releases 514 -> 452 earlier than strict R3, but only after 60D trend repair and credit stability.
+    recent_vix_peak_120d = vix.rolling(120, min_periods=20).max()
+    recent_score_peak_120d = components["total_score"].rolling(120, min_periods=20).max()
+    conds["medium_repair_regime"] = (
+        (recent_vix_peak_120d >= 28)
+        & (recent_score_peak_120d >= 75)
+        & (~conds["fast_panic_regime"])
+    )
+    conds["medium_vix_cool"] = vix < 22
+    conds["medium_score_ok"] = components["total_score"] <= 45
+    conds["medium_momentum_ok"] = components["market_momentum_score"] < 20
+    conds["medium_credit_ok"] = components["credit_proxy_score"] < 12
+    conds["medium_qqq_above_ma60"] = qqq > ma(qqq, 60)
+    conds["medium_soxx_above_ma60"] = soxx > ma(soxx, 60)
+    conds["medium_credit_above_ma60"] = credit > ma(credit, 60)
+    conds["medium_qqq_20d_return_positive"] = safe_pct_change(qqq, 20) > 0
+    conds["medium_count"] = conds[[
+        "medium_repair_regime",
+        "medium_vix_cool",
+        "medium_score_ok",
+        "medium_momentum_ok",
+        "medium_credit_ok",
+        "medium_qqq_above_ma60",
+        "medium_soxx_above_ma60",
+        "medium_credit_above_ma60",
+        "medium_qqq_20d_return_positive",
+    ]].sum(axis=1)
+    conds["medium_release_confirm"] = conds["medium_repair_regime"] & (conds["medium_count"] >= 7)
+
     return conds
 
 
@@ -277,6 +313,7 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 3) -> pd.DataFram
     release_pending_count = 0
     fast_release_pending_count = 0
     fast_r_pending_count = 0
+    medium_release_pending_count = 0
 
     for _, row in out.iterrows():
         raw = row["raw_mode"]
@@ -285,6 +322,7 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 3) -> pd.DataFram
         release_confirm = bool(row.get("release_confirm", False))
         fast_release_confirm = bool(row.get("fast_release_confirm", False))
         fast_r_confirm = bool(row.get("fast_r_confirm", False))
+        medium_release_confirm = bool(row.get("medium_release_confirm", False))
 
         reason = "維持原模式"
 
@@ -296,6 +334,7 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 3) -> pd.DataFram
             release_pending_count = 0
             fast_release_pending_count = 0
             fast_r_pending_count = 0
+            medium_release_pending_count = 0
             reason = "風險分數>=75，立即切514防守"
 
         elif current == "514" and fast_release_confirm:
@@ -310,6 +349,20 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 3) -> pd.DataFram
                 reason = "V型急殺後快速回攻通道成立，514→452"
             else:
                 reason = f"快速回攻第{fast_release_pending_count}週觀察，暫維持514"
+
+        elif current == "514" and medium_release_confirm:
+            # R6 medium lane: slower than 2020 fast lane, faster than strict R3.
+            pending = None
+            pending_count = 0
+            r_pending_count = 0
+            medium_release_pending_count += 1
+            if medium_release_pending_count >= 2:
+                current = "452"
+                release_pending_count = 0
+                fast_release_pending_count = 0
+                reason = "中型修復通道連續2週成立，514→452"
+            else:
+                reason = f"中型修復通道第{medium_release_pending_count}週觀察，暫維持514"
 
         elif current == "514" and r_confirm:
             release_pending_count = 0
@@ -353,7 +406,8 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 3) -> pd.DataFram
                         reason = f"解除防守條件第{release_pending_count}週觀察，暫維持514"
                 else:
                     release_pending_count = 0
-                    reason = "分數降溫但解除防守條件不足，暫維持514"
+                    medium_release_pending_count = 0
+                reason = "分數降溫但解除防守條件不足，暫維持514"
 
             # Once in 433, if risk rises again, go back to 514 immediately above 56.
             elif current == "433" and target == "514":
@@ -363,6 +417,7 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 3) -> pd.DataFram
                 release_pending_count = 0
                 fast_release_pending_count = 0
                 fast_r_pending_count = 0
+                medium_release_pending_count = 0
                 reason = "反攻後風險再升，切回514"
 
             elif target != current:
@@ -441,6 +496,7 @@ def make_switch_log(weekly: pd.DataFrame) -> pd.DataFrame:
         "total_score", "final_mode", "raw_mode", "r_count", "r_watch", "r_confirm",
         "r_credit_veto", "r_momentum_veto", "r_score_veto", "release_confirm",
         "fast_count", "fast_release_confirm", "fast_r_confirm",
+        "medium_repair_regime", "medium_count", "medium_release_confirm",
         "release_qqq_above_ma60", "release_soxx_above_ma60", "release_credit_above_ma60",
         "market_momentum_score", "credit_proxy_score", "breadth_score", "vix_score",
         "defensive_strength_score", "mode_reason",
@@ -461,7 +517,7 @@ def make_summary(weekly: pd.DataFrame, switch_log: pd.DataFrame, start: str, end
         return pd.Timestamp(x).strftime("%Y-%m-%d")
 
     lines = []
-    lines.append("# V11-Core 2022 Event Backtest R5-fixed Summary")
+    lines.append("# V11-Core 2022 Event Backtest R6 Summary")
     lines.append("")
     lines.append(f"Period: {start} to {end}")
     lines.append("")
@@ -489,10 +545,11 @@ def make_summary(weekly: pd.DataFrame, switch_log: pd.DataFrame, start: str, end
             )
     lines.append("")
     lines.append("## How to judge this backtest")
-    lines.append("- Good: 2022 risk expansion shifts to 514 before or during the main drawdown, not after the entire bear market is over.")
-    lines.append("- Good: R/433 does not trigger on every short bear-market bounce.")
+    lines.append("- Good: 2022 risk expansion shifts to 514 early and avoids false bear-market rebounds.")
+    lines.append("- Good: R/433 does not trigger on every short bear-market / correction bounce.")
     lines.append("- Revised R filter: 433 requires R>=4/5, total_score<=35, credit_proxy_score<12, market_momentum_score<20, and 3 consecutive weekly confirmations by default.")
     lines.append("- R5 fast lane: after a true panic regime, if VIX cools sharply and QQQ/SOXX/credit regain 20D trends, 514 can release to 452 earlier; 433 still needs extra confirmation.")
+    lines.append("- R6 medium repair lane: 514 can release to 452 only after medium repair conditions hold for 2 weeks; this test checks whether 2022 bear-market bounces are filtered out.")
     lines.append("- Good: Once capital returns, the model can leave 514 instead of staying permanently defensive.")
     lines.append("- Bad: Model stays 452 through the main drawdown.")
     lines.append("- Bad: Model flips between 452/514/433 too often.")
@@ -500,7 +557,7 @@ def make_summary(weekly: pd.DataFrame, switch_log: pd.DataFrame, start: str, end
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run V11-Core 2022 event backtest R4.")
+    parser = argparse.ArgumentParser(description="Run V11-Core 2022 Event Backtest R6.")
     parser.add_argument("--start", default=DEFAULT_START)
     parser.add_argument("--end", default=DEFAULT_END)
     # Revised after first backtest: 433 should require more confirmation.
