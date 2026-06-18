@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-V11-Core 2022 Event Backtest R7
+V11-Core 2022 Event Backtest R7.2
 
 Goal:
 - Test whether V11 can switch from 452 to 514 after capital starts leaving risk assets.
@@ -159,7 +159,7 @@ def score_defensive_strength(df: pd.DataFrame) -> pd.Series:
 
 def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
     """
-    Stricter V11 R-mode rules plus R4 V-shaped rebound fast lane and R7 stricter medium repair lane.
+    Stricter V11 R-mode rules plus R4 V-shaped rebound fast lane, R7 stricter medium repair lane, and R7.2 credit-crisis-only anti-whipsaw gate.
 
     R2 fixed:
     - 433 triggered too early during bear-market rallies.
@@ -254,6 +254,23 @@ def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
         & (components["credit_proxy_score"] < 12)
     )
 
+    # R7.2: credit-crisis-only anti-whipsaw gate.
+    # Only arm this 2008-style gate when credit has suffered a deep/prolonged drawdown.
+    credit_252d_high = credit.rolling(252, min_periods=60).max()
+    credit_drawdown_252d = credit / credit_252d_high - 1.0
+    recent_deep_credit_drawdown = credit_drawdown_252d.rolling(90, min_periods=10).min() <= -0.18
+    conds["credit_crisis_regime"] = conds["fast_panic_regime"] & recent_deep_credit_drawdown
+    conds["fast_release_safe"] = (
+        conds["fast_release_confirm"]
+        & (
+            (~conds["credit_crisis_regime"])
+            | (
+                (components["total_score"] < 75)
+                & (components["credit_proxy_score"] < 12)
+            )
+        )
+    )
+
     # R7: stricter medium repair lane.
     # For 2018 Q4-like corrections: VIX and score were elevated, but not a full 2020-style panic.
     # R7 tightens R6 to avoid 2022-style bear-market rallies: momentum repair is mandatory, not just part of a score count.
@@ -335,6 +352,8 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 3) -> pd.DataFram
         r_confirm = bool(row.get("r_confirm", False))
         release_confirm = bool(row.get("release_confirm", False))
         fast_release_confirm = bool(row.get("fast_release_confirm", False))
+        fast_release_safe = bool(row.get("fast_release_safe", fast_release_confirm))
+        credit_crisis_regime = bool(row.get("credit_crisis_regime", False))
         fast_r_confirm = bool(row.get("fast_r_confirm", False))
         medium_release_confirm = bool(row.get("medium_release_confirm", False))
 
@@ -351,7 +370,7 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 3) -> pd.DataFram
             medium_release_pending_count = 0
             reason = "風險分數>=75，立即切514防守"
 
-        elif current == "514" and fast_release_confirm:
+        elif current == "514" and fast_release_safe:
             # R5 fast lane: after a true panic regime, allow earlier release from 514 to 452.
             pending = None
             pending_count = 0
@@ -509,7 +528,7 @@ def make_switch_log(weekly: pd.DataFrame) -> pd.DataFrame:
     cols = [
         "total_score", "final_mode", "raw_mode", "r_count", "r_watch", "r_confirm",
         "r_credit_veto", "r_momentum_veto", "r_score_veto", "release_confirm",
-        "fast_count", "fast_release_confirm", "fast_r_confirm",
+        "fast_count", "fast_release_confirm", "fast_release_safe", "credit_crisis_regime", "fast_r_confirm",
         "medium_repair_regime", "medium_count", "medium_release_confirm",
         "release_qqq_above_ma60", "release_soxx_above_ma60", "release_credit_above_ma60",
         "market_momentum_score", "credit_proxy_score", "breadth_score", "vix_score",
@@ -531,7 +550,7 @@ def make_summary(weekly: pd.DataFrame, switch_log: pd.DataFrame, start: str, end
         return pd.Timestamp(x).strftime("%Y-%m-%d")
 
     lines = []
-    lines.append("# V11-Core 2022 Event Backtest R7 Summary")
+    lines.append("# V11-Core 2022 Event Backtest R7.2 Summary")
     lines.append("")
     lines.append(f"Period: {start} to {end}")
     lines.append("")
@@ -571,7 +590,7 @@ def make_summary(weekly: pd.DataFrame, switch_log: pd.DataFrame, start: str, end
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run V11-Core 2022 Event Backtest R7.")
+    parser = argparse.ArgumentParser(description="Run V11-Core 2022 Event Backtest R7.2.")
     parser.add_argument("--start", default=DEFAULT_START)
     parser.add_argument("--end", default=DEFAULT_END)
     # Revised after first backtest: 433 should require more confirmation.
