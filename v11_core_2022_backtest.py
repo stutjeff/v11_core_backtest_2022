@@ -157,7 +157,18 @@ def score_defensive_strength(df: pd.DataFrame) -> pd.Series:
     return pd.Series(score, index=df.index).clip(upper=15)
 
 
-def compute_r_mode(df: pd.DataFrame, total_score: pd.Series) -> pd.DataFrame:
+def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
+    """
+    Stricter V11 R-mode rules, revised after the first 2022 backtest.
+
+    Problem found in v1:
+    - R-mode triggered too early during bear-market rallies in 2022.
+
+    Fixes:
+    - Credit veto: if HYG/LQD stress is still high, 433 is not allowed.
+    - Momentum veto: if QQQ/SOXX trend damage is still high, 433 is not allowed.
+    - Score veto: total risk must cool to <= 35 before 433 can be confirmed.
+    """
     qqq = df["QQQ"]
     soxx = df["SOXX"]
     credit = df["HYG"] / df["LQD"]
@@ -169,10 +180,25 @@ def compute_r_mode(df: pd.DataFrame, total_score: pd.Series) -> pd.DataFrame:
     conds["r_credit_above_ma20"] = credit > ma(credit, 20)
     conds["r_vix_below_25"] = vix < 25
     conds["r_qqq_20d_return_positive"] = safe_pct_change(qqq, 20) > 0
-    conds["r_count"] = conds.sum(axis=1)
-    conds["r_watch"] = conds["r_count"] >= 3
-    # R mode should not override a high-risk environment. It must confirm risk has cooled.
-    conds["r_confirm"] = (conds["r_count"] >= 4) & (total_score <= 55)
+    conds["r_count"] = conds[[
+        "r_qqq_above_ma20",
+        "r_soxx_above_ma20",
+        "r_credit_above_ma20",
+        "r_vix_below_25",
+        "r_qqq_20d_return_positive",
+    ]].sum(axis=1)
+
+    conds["r_credit_veto"] = components["credit_proxy_score"] >= 12
+    conds["r_momentum_veto"] = components["market_momentum_score"] >= 20
+    conds["r_score_veto"] = components["total_score"] > 35
+
+    conds["r_watch"] = (conds["r_count"] >= 3) & (~conds["r_credit_veto"])
+    conds["r_confirm"] = (
+        (conds["r_count"] >= 4)
+        & (~conds["r_credit_veto"])
+        & (~conds["r_momentum_veto"])
+        & (~conds["r_score_veto"])
+    )
     return conds
 
 
@@ -187,7 +213,7 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 2) -> pd.DataFram
     Stabilize mode changes:
     - Emergency de-risk to 514 if score >= 75: immediate.
     - Otherwise require the same raw recommendation for cooldown_weeks consecutive weeks.
-    - 433 requires R-confirmation for cooldown_weeks consecutive weeks, and normally comes after 514.
+    - 433 requires stricter R-confirmation for cooldown_weeks consecutive weeks, and normally comes after 514.
     """
     out = weekly.copy()
     final_modes: List[str] = []
@@ -270,7 +296,7 @@ def build_backtest(start: str, end: str, cooldown_weeks: int) -> pd.DataFrame:
     components["defensive_strength_score"] = score_defensive_strength(daily)
     components["total_score"] = components.sum(axis=1).clip(upper=100)
 
-    r = compute_r_mode(daily, components["total_score"])
+    r = compute_r_mode(daily, components)
     full = pd.concat([daily, components, r], axis=1)
 
     # Weekly Friday snapshot. If Friday is holiday, use the last available trading day in that week.
@@ -304,6 +330,7 @@ def make_switch_log(weekly: pd.DataFrame) -> pd.DataFrame:
     changes = weekly[weekly["final_mode"].ne(weekly["final_mode"].shift(1))].copy()
     cols = [
         "total_score", "final_mode", "raw_mode", "r_count", "r_watch", "r_confirm",
+        "r_credit_veto", "r_momentum_veto", "r_score_veto",
         "market_momentum_score", "credit_proxy_score", "breadth_score", "vix_score",
         "defensive_strength_score", "mode_reason",
     ]
@@ -353,6 +380,7 @@ def make_summary(weekly: pd.DataFrame, switch_log: pd.DataFrame, start: str, end
     lines.append("## How to judge this backtest")
     lines.append("- Good: 2022 risk expansion shifts to 514 before or during the main drawdown, not after the entire bear market is over.")
     lines.append("- Good: R/433 does not trigger on every short bear-market bounce.")
+    lines.append("- Revised R filter: 433 requires R>=4/5, total_score<=35, credit_proxy_score<12, market_momentum_score<20, and 3 consecutive weekly confirmations by default.")
     lines.append("- Good: Once capital returns, the model can leave 514 instead of staying permanently defensive.")
     lines.append("- Bad: Model stays 452 through the main drawdown.")
     lines.append("- Bad: Model flips between 452/514/433 too often.")
@@ -363,7 +391,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run V11-Core 2022 event backtest.")
     parser.add_argument("--start", default=DEFAULT_START)
     parser.add_argument("--end", default=DEFAULT_END)
-    parser.add_argument("--cooldown-weeks", type=int, default=2)
+    # Revised after first backtest: 433 should require more confirmation.
+    parser.add_argument("--cooldown-weeks", type=int, default=3)
     parser.add_argument("--output-dir", default="output")
     args = parser.parse_args()
 
