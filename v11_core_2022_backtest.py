@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-V11-Core 2022 Event Backtest R4
+V11-Core 2022 Event Backtest R5
 
 Goal:
 - Test whether V11 can switch from 452 to 514 after capital starts leaving risk assets.
@@ -159,7 +159,7 @@ def score_defensive_strength(df: pd.DataFrame) -> pd.Series:
 
 def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
     """
-    Stricter V11 R-mode rules plus R4 V-shaped rebound fast lane.
+    Stricter V11 R-mode rules plus R5 V-shaped rebound fast lane.
 
     R2 fixed:
     - 433 triggered too early during bear-market rallies.
@@ -169,7 +169,7 @@ def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
     - In a bear market, simply cooling from 60 score to 35 score is not enough.
       QQQ/SOXX/credit must regain trend before leaving 514.
 
-    R4 adds:
+    R5 adds:
     - V-shaped rebound fast lane after a true panic regime.
     - If VIX and total score spiked to panic levels, then VIX cools sharply and QQQ/SOXX/credit regain 20D trends, allow 514 -> 452 earlier.
     """
@@ -223,12 +223,23 @@ def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
         & conds["release_credit_above_ma60"]
     )
 
-    # R4: V-shaped rebound fast lane.
-    # This is only armed after a true panic regime, so ordinary bear-market rallies should not pass it easily.
-    recent_vix_peak_90d = vix.rolling(90, min_periods=10).max()
-    recent_score_peak_90d = components["total_score"].rolling(90, min_periods=10).max()
-    conds["fast_panic_regime"] = (recent_vix_peak_90d > 40) & (recent_score_peak_90d > 85)
-    conds["fast_vix_cooldown"] = (vix / recent_vix_peak_90d - 1.0) <= -0.40
+    # R5: V-shaped rebound fast lane, but only after a TRUE acute crash.
+    # R5 helped 2020, but it was too easy to trigger during 2022 bear-market rallies.
+    # R5 therefore requires a panic regime AND a sharp drawdown speed signature.
+    recent_vix_peak_45d = vix.rolling(45, min_periods=10).max()
+    recent_score_peak_45d = components["total_score"].rolling(45, min_periods=10).max()
+    recent_qqq_20d_min_45d = safe_pct_change(qqq, 20).rolling(45, min_periods=10).min()
+    recent_soxx_20d_min_45d = safe_pct_change(soxx, 20).rolling(45, min_periods=10).min()
+    conds["fast_panic_regime"] = (
+        (recent_vix_peak_45d >= 50)
+        | (
+            (recent_vix_peak_45d >= 40)
+            & (recent_score_peak_45d > 85)
+            & (recent_qqq_20d_min_45d <= -0.18)
+            & (recent_soxx_20d_min_45d <= -0.25)
+        )
+    )
+    conds["fast_vix_cooldown"] = (vix / recent_vix_peak_45d - 1.0) <= -0.40
     conds["fast_qqq_above_ma20"] = qqq > ma(qqq, 20)
     conds["fast_soxx_above_ma20"] = soxx > ma(soxx, 20)
     conds["fast_credit_above_ma20"] = credit > ma(credit, 20)
@@ -295,7 +306,7 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 3) -> pd.DataFram
             reason = "風險分數>=75，立即切514防守"
 
         elif current == "514" and fast_release_confirm:
-            # R4 fast lane: after a true panic regime, allow earlier release from 514 to 452.
+            # R5 fast lane: after a true panic regime, allow earlier release from 514 to 452.
             pending = None
             pending_count = 0
             r_pending_count = 0
@@ -457,7 +468,7 @@ def make_summary(weekly: pd.DataFrame, switch_log: pd.DataFrame, start: str, end
         return pd.Timestamp(x).strftime("%Y-%m-%d")
 
     lines = []
-    lines.append("# V11-Core 2022 Event Backtest R4 Summary")
+    lines.append("# V11-Core 2022 Event Backtest R5 Summary")
     lines.append("")
     lines.append(f"Period: {start} to {end}")
     lines.append("")
@@ -488,7 +499,7 @@ def make_summary(weekly: pd.DataFrame, switch_log: pd.DataFrame, start: str, end
     lines.append("- Good: 2022 risk expansion shifts to 514 before or during the main drawdown, not after the entire bear market is over.")
     lines.append("- Good: R/433 does not trigger on every short bear-market bounce.")
     lines.append("- Revised R filter: 433 requires R>=4/5, total_score<=35, credit_proxy_score<12, market_momentum_score<20, and 3 consecutive weekly confirmations by default.")
-    lines.append("- R4 fast lane: after a true panic regime, if VIX cools sharply and QQQ/SOXX/credit regain 20D trends, 514 can release to 452 earlier; 433 still needs extra confirmation.")
+    lines.append("- R5 fast lane: after a true panic regime, if VIX cools sharply and QQQ/SOXX/credit regain 20D trends, 514 can release to 452 earlier; 433 still needs extra confirmation.")
     lines.append("- Good: Once capital returns, the model can leave 514 instead of staying permanently defensive.")
     lines.append("- Bad: Model stays 452 through the main drawdown.")
     lines.append("- Bad: Model flips between 452/514/433 too often.")
@@ -496,7 +507,7 @@ def make_summary(weekly: pd.DataFrame, switch_log: pd.DataFrame, start: str, end
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run V11-Core 2022 event backtest R4.")
+    parser = argparse.ArgumentParser(description="Run V11-Core 2022 event backtest R5.")
     parser.add_argument("--start", default=DEFAULT_START)
     parser.add_argument("--end", default=DEFAULT_END)
     # Revised after first backtest: 433 should require more confirmation.
