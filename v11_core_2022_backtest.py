@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-V11-Core 2022 Event Backtest R5
+V11-Core 2022 Event Backtest R5-fixed
 
 Goal:
 - Test whether V11 can switch from 452 to 514 after capital starts leaving risk assets.
@@ -159,7 +159,7 @@ def score_defensive_strength(df: pd.DataFrame) -> pd.Series:
 
 def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
     """
-    Stricter V11 R-mode rules plus R5 V-shaped rebound fast lane.
+    Stricter V11 R-mode rules plus R4 V-shaped rebound fast lane.
 
     R2 fixed:
     - 433 triggered too early during bear-market rallies.
@@ -169,7 +169,7 @@ def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
     - In a bear market, simply cooling from 60 score to 35 score is not enough.
       QQQ/SOXX/credit must regain trend before leaving 514.
 
-    R5 adds:
+    R4 adds:
     - V-shaped rebound fast lane after a true panic regime.
     - If VIX and total score spiked to panic levels, then VIX cools sharply and QQQ/SOXX/credit regain 20D trends, allow 514 -> 452 earlier.
     """
@@ -223,23 +223,12 @@ def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
         & conds["release_credit_above_ma60"]
     )
 
-    # R5: V-shaped rebound fast lane, but only after a TRUE acute crash.
-    # R5 helped 2020, but it was too easy to trigger during 2022 bear-market rallies.
-    # R5 therefore requires a panic regime AND a sharp drawdown speed signature.
-    recent_vix_peak_45d = vix.rolling(45, min_periods=10).max()
-    recent_score_peak_45d = components["total_score"].rolling(45, min_periods=10).max()
-    recent_qqq_20d_min_45d = safe_pct_change(qqq, 20).rolling(45, min_periods=10).min()
-    recent_soxx_20d_min_45d = safe_pct_change(soxx, 20).rolling(45, min_periods=10).min()
-    conds["fast_panic_regime"] = (
-        (recent_vix_peak_45d >= 50)
-        | (
-            (recent_vix_peak_45d >= 40)
-            & (recent_score_peak_45d > 85)
-            & (recent_qqq_20d_min_45d <= -0.18)
-            & (recent_soxx_20d_min_45d <= -0.25)
-        )
-    )
-    conds["fast_vix_cooldown"] = (vix / recent_vix_peak_45d - 1.0) <= -0.40
+    # R4: V-shaped rebound fast lane.
+    # This is only armed after a true panic regime, so ordinary bear-market rallies should not pass it easily.
+    recent_vix_peak_90d = vix.rolling(90, min_periods=10).max()
+    recent_score_peak_90d = components["total_score"].rolling(90, min_periods=10).max()
+    conds["fast_panic_regime"] = (recent_vix_peak_90d > 40) & (recent_score_peak_90d > 85)
+    conds["fast_vix_cooldown"] = (vix / recent_vix_peak_90d - 1.0) <= -0.40
     conds["fast_qqq_above_ma20"] = qqq > ma(qqq, 20)
     conds["fast_soxx_above_ma20"] = soxx > ma(soxx, 20)
     conds["fast_credit_above_ma20"] = credit > ma(credit, 20)
@@ -254,8 +243,12 @@ def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
         "fast_qqq_20d_return_positive",
         "fast_vix_below_35",
     ]].sum(axis=1)
-    conds["fast_release_confirm"] = conds["fast_count"] >= 5
-    conds["fast_r_confirm"] = (conds["fast_count"] >= 6) & (components["credit_proxy_score"] < 12)
+    conds["fast_release_confirm"] = conds["fast_panic_regime"] & (conds["fast_count"] >= 5)
+    conds["fast_r_confirm"] = (
+        conds["fast_panic_regime"]
+        & (conds["fast_count"] >= 6)
+        & (components["credit_proxy_score"] < 12)
+    )
     return conds
 
 
@@ -468,7 +461,7 @@ def make_summary(weekly: pd.DataFrame, switch_log: pd.DataFrame, start: str, end
         return pd.Timestamp(x).strftime("%Y-%m-%d")
 
     lines = []
-    lines.append("# V11-Core 2022 Event Backtest R5 Summary")
+    lines.append("# V11-Core 2022 Event Backtest R5-fixed Summary")
     lines.append("")
     lines.append(f"Period: {start} to {end}")
     lines.append("")
@@ -507,7 +500,7 @@ def make_summary(weekly: pd.DataFrame, switch_log: pd.DataFrame, start: str, end
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run V11-Core 2022 event backtest R5.")
+    parser = argparse.ArgumentParser(description="Run V11-Core 2022 event backtest R4.")
     parser.add_argument("--start", default=DEFAULT_START)
     parser.add_argument("--end", default=DEFAULT_END)
     # Revised after first backtest: 433 should require more confirmation.

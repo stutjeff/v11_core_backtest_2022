@@ -1,4 +1,4 @@
-# V11-Core 2022 Event Backtest R5
+# V11-Core 2022 Event Backtest R5-fixed
 
 這是 V11-Core 的 2022 升息殺估值回測版。
 
@@ -23,3 +23,8 @@ python v11_core_2022_backtest.py
 - output/v11_core_2022_weekly_modes.csv
 - output/v11_core_2022_switch_log.csv
 - output/v11_core_2022_summary.md
+
+
+## R5-fixed 修正
+
+這版修正快速回攻通道：`fast_release_confirm` 與 `fast_r_confirm` 必須同時滿足 `fast_panic_regime == True`，避免 2022 慢熊反彈被誤判成 2020 類型 V 型急殺反彈。
