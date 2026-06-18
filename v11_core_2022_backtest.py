@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-V11-Core 2022 Event Backtest
+V11-Core 2022 Event Backtest R3
 
 Goal:
 - Test whether V11 can switch from 452 to 514 after capital starts leaving risk assets.
@@ -161,13 +161,13 @@ def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
     """
     Stricter V11 R-mode rules, revised after the first 2022 backtest.
 
-    Problem found in v1:
-    - R-mode triggered too early during bear-market rallies in 2022.
+    R2 fixed:
+    - 433 triggered too early during bear-market rallies.
 
-    Fixes:
-    - Credit veto: if HYG/LQD stress is still high, 433 is not allowed.
-    - Momentum veto: if QQQ/SOXX trend damage is still high, 433 is not allowed.
-    - Score veto: total risk must cool to <= 35 before 433 can be confirmed.
+    R3 adds:
+    - 514 -> 452 release also needs confirmation.
+    - In a bear market, simply cooling from 60 score to 35 score is not enough.
+      QQQ/SOXX/credit must regain trend before leaving 514.
     """
     qqq = df["QQQ"]
     soxx = df["SOXX"]
@@ -199,6 +199,25 @@ def compute_r_mode(df: pd.DataFrame, components: pd.DataFrame) -> pd.DataFrame:
         & (~conds["r_momentum_veto"])
         & (~conds["r_score_veto"])
     )
+
+    # R3: leaving 514 is not the same as launching 433.
+    # It still requires capital to show real stabilization, not just a short bounce.
+    conds["release_qqq_above_ma60"] = qqq > ma(qqq, 60)
+    conds["release_soxx_above_ma60"] = soxx > ma(soxx, 60)
+    conds["release_credit_above_ma60"] = credit > ma(credit, 60)
+    conds["release_score_ok"] = components["total_score"] <= 35
+    conds["release_momentum_ok"] = components["market_momentum_score"] < 20
+    conds["release_credit_ok"] = components["credit_proxy_score"] < 12
+    conds["release_vix_ok"] = vix < 25
+    conds["release_confirm"] = (
+        conds["release_score_ok"]
+        & conds["release_momentum_ok"]
+        & conds["release_credit_ok"]
+        & conds["release_vix_ok"]
+        & conds["release_qqq_above_ma60"]
+        & conds["release_soxx_above_ma60"]
+        & conds["release_credit_above_ma60"]
+    )
     return conds
 
 
@@ -208,12 +227,13 @@ def raw_mode_from_score(score: float) -> str:
     return "514"
 
 
-def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 2) -> pd.DataFrame:
+def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 3) -> pd.DataFrame:
     """
     Stabilize mode changes:
     - Emergency de-risk to 514 if score >= 75: immediate.
-    - Otherwise require the same raw recommendation for cooldown_weeks consecutive weeks.
-    - 433 requires stricter R-confirmation for cooldown_weeks consecutive weeks, and normally comes after 514.
+    - 452 -> 514 requires repeated risk signal unless emergency.
+    - 514 -> 452 requires release_confirm repeated; raw score cooling alone is not enough.
+    - 514 -> 433 requires stricter R-confirmation repeated.
     """
     out = weekly.copy()
     final_modes: List[str] = []
@@ -223,11 +243,13 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 2) -> pd.DataFram
     pending = None
     pending_count = 0
     r_pending_count = 0
+    release_pending_count = 0
 
     for _, row in out.iterrows():
         raw = row["raw_mode"]
         score = float(row["total_score"])
-        r_confirm = bool(row["r_confirm"])
+        r_confirm = bool(row.get("r_confirm", False))
+        release_confirm = bool(row.get("release_confirm", False))
 
         reason = "維持原模式"
 
@@ -236,9 +258,11 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 2) -> pd.DataFram
             pending = None
             pending_count = 0
             r_pending_count = 0
+            release_pending_count = 0
             reason = "風險分數>=75，立即切514防守"
 
         elif current == "514" and r_confirm:
+            release_pending_count = 0
             r_pending_count += 1
             if r_pending_count >= cooldown_weeks:
                 current = "433"
@@ -250,15 +274,33 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 2) -> pd.DataFram
 
         else:
             r_pending_count = 0
-
             target = raw
+
+            if current == "514" and target == "452":
+                pending = None
+                pending_count = 0
+                if release_confirm:
+                    release_pending_count += 1
+                    if release_pending_count >= cooldown_weeks:
+                        current = "452"
+                        release_pending_count = 0
+                        reason = f"解除防守條件連續{cooldown_weeks}週成立，514→452"
+                    else:
+                        reason = f"解除防守條件第{release_pending_count}週觀察，暫維持514"
+                else:
+                    release_pending_count = 0
+                    reason = "分數降溫但解除防守條件不足，暫維持514"
+
             # Once in 433, if risk rises again, go back to 514 immediately above 56.
-            if current == "433" and target == "514":
+            elif current == "433" and target == "514":
                 current = "514"
                 pending = None
                 pending_count = 0
+                release_pending_count = 0
                 reason = "反攻後風險再升，切回514"
+
             elif target != current:
+                release_pending_count = 0
                 if pending == target:
                     pending_count += 1
                 else:
@@ -275,6 +317,7 @@ def apply_cooldown(weekly: pd.DataFrame, cooldown_weeks: int = 2) -> pd.DataFram
             else:
                 pending = None
                 pending_count = 0
+                release_pending_count = 0
                 reason = "分數與目前模式一致"
 
         final_modes.append(current)
@@ -330,7 +373,8 @@ def make_switch_log(weekly: pd.DataFrame) -> pd.DataFrame:
     changes = weekly[weekly["final_mode"].ne(weekly["final_mode"].shift(1))].copy()
     cols = [
         "total_score", "final_mode", "raw_mode", "r_count", "r_watch", "r_confirm",
-        "r_credit_veto", "r_momentum_veto", "r_score_veto",
+        "r_credit_veto", "r_momentum_veto", "r_score_veto", "release_confirm",
+        "release_qqq_above_ma60", "release_soxx_above_ma60", "release_credit_above_ma60",
         "market_momentum_score", "credit_proxy_score", "breadth_score", "vix_score",
         "defensive_strength_score", "mode_reason",
     ]
@@ -350,7 +394,7 @@ def make_summary(weekly: pd.DataFrame, switch_log: pd.DataFrame, start: str, end
         return pd.Timestamp(x).strftime("%Y-%m-%d")
 
     lines = []
-    lines.append("# V11-Core 2022 Event Backtest Summary")
+    lines.append("# V11-Core 2022 Event Backtest R3 Summary")
     lines.append("")
     lines.append(f"Period: {start} to {end}")
     lines.append("")
@@ -388,7 +432,7 @@ def make_summary(weekly: pd.DataFrame, switch_log: pd.DataFrame, start: str, end
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run V11-Core 2022 event backtest.")
+    parser = argparse.ArgumentParser(description="Run V11-Core 2022 event backtest R3.")
     parser.add_argument("--start", default=DEFAULT_START)
     parser.add_argument("--end", default=DEFAULT_END)
     # Revised after first backtest: 433 should require more confirmation.
